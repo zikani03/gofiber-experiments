@@ -96,7 +96,7 @@ func main() {
 	})
 
 	app.Get("/auth/logout", func(c *fiber.Ctx) error {
-		// gothic.Logout(adaptor.FiberHandler(c))
+		store.Storage.Delete("auth.user")
 		return c.Redirect("/", http.StatusTemporaryRedirect)
 	})
 
