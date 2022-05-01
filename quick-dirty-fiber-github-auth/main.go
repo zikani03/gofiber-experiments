@@ -1,18 +1,21 @@
 package main
 
 import (
-	"context"
-	"fmt"
+	"encoding/json"
 	"net/http"
 	"os"
+	"time"
 
+	"github.com/dghubble/gologin/v2"
+	"github.com/dghubble/gologin/v2/github"
 	"github.com/gofiber/adaptor/v2"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/session"
+	"github.com/gofiber/template/django"
+	gogithub "github.com/google/go-github/v44/github"
 	_ "github.com/joho/godotenv/autoload"
-	"github.com/markbates/goth"
-	"github.com/markbates/goth/gothic"
-	"github.com/markbates/goth/providers/github"
-	fiberScriggo "github.com/zikani03/fiber-scriggo"
+	"golang.org/x/oauth2"
+	githubOAuth2 "golang.org/x/oauth2/github"
 )
 
 func staticPage(templateFile, title string) func(*fiber.Ctx) error {
@@ -21,14 +24,37 @@ func staticPage(templateFile, title string) func(*fiber.Ctx) error {
 	}
 }
 
+// issueSession issues a cookie session after successful Github login
+func issueSession(store *session.Store) http.Handler {
+	fn := func(w http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
+		githubUser, err := github.UserFromContext(ctx)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		data, err := json.Marshal(githubUser)
+		if err == nil {
+			store.Storage.Set("auth.user", data, time.Duration(24*time.Hour))
+		}
+		http.Redirect(w, req, "/home", http.StatusFound)
+	}
+	return http.HandlerFunc(fn)
+}
+
 func main() {
-	githubProvider := github.New(os.Getenv("GITHUB_KEY"), os.Getenv("GITHUB_SECRET"), os.Getenv("AUTH_CALLBACK_URL"))
+	// 1. Register LoginHandler and CallbackHandler
+	oauth2Config := &oauth2.Config{
+		ClientID:     os.Getenv("GITHUB_KEY"),
+		ClientSecret: os.Getenv("GITHUB_SECRET"),
+		RedirectURL:  os.Getenv("AUTH_CALLBACK_URL"),
+		Endpoint:     githubOAuth2.Endpoint,
+	}
+	// state param cookies require HTTPS by default; disable for localhost development
+	stateConfig := gologin.DebugOnlyCookieConfig
 
-	goth.UseProviders(githubProvider)
-
-	gothic.Store = NewProviderStore()
-
-	engine := fiberScriggo.New("./templates", ".html")
+	store := session.New()
+	engine := django.New("./templates", ".html")
 
 	engine.Debug(true)
 
@@ -43,49 +69,26 @@ func main() {
 	app.Get("/login", staticPage("login", "Login"))
 	app.Get("/auth/error", staticPage("auth_error", "Auth Error"))
 
-	gothLoginMiddleware := func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
-			ctx := context.WithValue(req.Context(), "provider", "github")
-			reqCtx := req.WithContext(ctx)
-			gothUser, err := gothic.CompleteUserAuth(res, reqCtx)
-			if err == nil {
-				ctx := context.WithValue(req.Context(), "user", gothUser)
-				fmt.Println("authenticated ", gothUser)
-				//store.Storage.Set("user", gothUser, time.Duration(24*time.Hour.Hours()))
+	app.Get("/auth/github", adaptor.HTTPHandler(github.StateHandler(stateConfig, github.LoginHandler(oauth2Config, nil))))
 
-				next.ServeHTTP(res, req.WithContext(ctx))
-				return
-			} else {
-				gothic.BeginAuthHandler(res, reqCtx)
-			}
-		})
+	githubCallback := adaptor.HTTPHandler(github.StateHandler(stateConfig, github.CallbackHandler(oauth2Config, issueSession(store), nil)))
+
+	app.Get("/auth/github/callback", githubCallback)
+
+	githubAuthMiddleware := func(c *fiber.Ctx) error {
+		userJson, err := store.Storage.Get("auth.user")
+		if err != nil {
+			return c.Redirect("/auth/error")
+		}
+		user := gogithub.User{}
+		json.Unmarshal(userJson, &user)
+		c.Locals("user", user)
+
+		return c.Next()
 	}
 
-	gothCallbackMiddleware := func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
-			gothUser, err := gothic.CompleteUserAuth(res, req)
-			if err == nil {
-				ctx := context.WithValue(req.Context(), "user", gothUser)
-				fmt.Println("authenticated ", gothUser)
-				next.ServeHTTP(res, req.WithContext(ctx))
-				return
-			}
-
-			next.ServeHTTP(res, req)
-		})
-	}
-
-	app.Get("/auth/github", adaptor.HTTPMiddleware(gothLoginMiddleware))
-
-	app.Get("/auth/github/callback", adaptor.HTTPMiddleware(gothCallbackMiddleware), func(c *fiber.Ctx) error {
-		gothUser := goth.User{} // TODO; Find a way to get this user from the damn session
-		c.Locals("user", gothUser)
-		return c.Redirect("/home")
-	})
-
-	app.Get("/home", adaptor.HTTPMiddleware(gothCallbackMiddleware), func(c *fiber.Ctx) error {
-		user := c.Locals("user")
-		fmt.Println("Found the user: ", user)
+	app.Get("/home", githubAuthMiddleware, func(c *fiber.Ctx) error {
+		user := c.Locals("user").(gogithub.User)
 		return c.Render("userinfo", fiber.Map{
 			"Title": "User Info",
 			"user":  &user,
